@@ -2418,11 +2418,13 @@
         let globalFriendshipBoost = 0; // 友情アップ共通カウント（全員共有）
         
         const BOUNCE = 0.85;
+        const ENEMY_RESTITUTION = 0.99; // 敵反射の反発係数。1.0で完全弾性＝本家のカンカン感（速度を保って何度も往復）
         const COLLISION_DAMPING = 0.88;
         const HIT_SLOWDOWN = 0.5;
         const STOP_THRESHOLD = 0.01;
         const VELOCITY_SCALE = 18.0;
         let hitFreezeFrames = 0; // 自身が敵に直接当たった時の一時フリーズ（1フレーム物理停止）
+        let screenShake = 0; // ★ 画面シェイク強度(px)。ヒット/爆発で加算し、描画ループで毎フレーム減衰
 
         // ★ 敵のビームクラス
         class EnemyBeam {
@@ -2996,6 +2998,8 @@
                 this.x = x; this.y = y;
                 this.maxRadius = radius * 3; this.currentRadius = radius;
                 this.color = color; this.particles = []; this.frame = 0; this.maxFrames = 40;
+                // ★ 爆発の大きさに応じて画面を揺らす（撃破・爆弾・特殊弾・被弾など全ての爆発に迫力が乗る）
+                screenShake = Math.min(24, screenShake + Math.min(14, radius * 0.35));
                 for (let i = 0; i < 10; i++) {
                     const angle = (Math.PI * 2 / 10) * i + Math.random() * 0.3;
                     const speed = 1.5 + Math.random() * 2.5;
@@ -5157,6 +5161,15 @@
             const rawDt = (nowTime - _lastFrameTime) / 16.667;
             const dt = Math.min(rawDt, 3); // 最大3倍速までに制限（タブ復帰時の暴走防止）
             _lastFrameTime = nowTime;
+            // ★ 画面シェイク：前景(gameCanvas)だけをずらす。背景(bgCanvas)は固定なので「カメラが揺れる」迫力になる
+            if (screenShake > 0.15) {
+                const _sa = Math.random() * Math.PI * 2;
+                canvas.style.transform = `translate3d(${(Math.cos(_sa) * screenShake).toFixed(2)}px, ${(Math.sin(_sa) * screenShake).toFixed(2)}px, 0)`;
+                screenShake *= Math.pow(0.82, dt); // 減衰
+            } else if (screenShake !== 0) {
+                screenShake = 0;
+                canvas.style.transform = 'translate3d(0,0,0)';
+            }
             ctx.clearRect(0, 0, canvasSize.width, canvasSize.height);
             ctx.fillStyle = 'rgba(0,0,0,0.18)'; // 六角形を透かすため半透明オーバーレイ
             ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
@@ -5311,7 +5324,12 @@
 
             // 2+3. 移動・壁判定・友情判定・敵/アイテム判定（サブステップ処理）
             // ★ 友情判定をサブステップ内に移動：高速通過によるすり抜けバグを修正
-            const SUBSTEPS = 4;
+            // ★ 速度に応じてサブステップ数を可変化：
+            //   高速弾の貫通(トンネリング)と、深くめり込んだ位置で法線を取ることによる
+            //   反射角のズレを防ぐ。1サブステップの移動量を約8px以下に保つ（敵半径より十分小さく）。
+            let _maxSpd = 0;
+            for (const _m of activeMarbles) { if (_m.isActive && _m.isMoving()) { const _s = Math.hypot(_m.vx, _m.vy); if (_s > _maxSpd) _maxSpd = _s; } }
+            const SUBSTEPS = Math.min(20, Math.max(4, Math.ceil((_maxSpd * VELOCITY_SCALE) / 8)));
             let pendingItemModal = null;
             let itemModalQueue = []; // 装備アイテム連続取得キュー
             let _itemModalPending = false; // エフェクト中フラグ（二重起動防止）
@@ -5472,40 +5490,55 @@
                             let normalX = cdx, normalY = cdy;
                             const dist = cdist;
                             if (dist > 0) { normalX /= dist; normalY /= dist; }
+                            else { normalX = 0; normalY = -1; } // 完全に重なった時の保険（向きが無いと押し出せない）
                             const overlap = marble.radius + enemy.radius - dist;
+                            // めり込み解消は接触している限り常に行う（挟まりの押し出しに必須）
                             if (overlap > 0) { marble.x += normalX * (overlap + 0.5); marble.y += normalY * (overlap + 0.5); }
                             const dotProduct = marble.vx * normalX + marble.vy * normalY;
-                            if (dotProduct < 0) { marble.vx -= 2 * dotProduct * normalX; marble.vy -= 2 * dotProduct * normalY; marble.vx *= 0.90; marble.vy *= 0.90; }
-                            const isCritical = Math.random() < 0.15;
-                            const baseDamage = (1.5 + playerAttackBonus) * marble.type.attackMult * (marble.isSpecialShot ? 3 : 1) * (marble.debuffHalfPower ? 0.5 : 1.0);
-                            // 弱点ヒット判定（ボスのみ）
-                            const isWeakHit = enemy.hitWeakPoint(marble.x, marble.y);
-                            const weakMult = isWeakHit ? 2.0 : 1.0;
-                            const damageToApply = (isCritical ? baseDamage * 7.5 : baseDamage) * weakMult;
-                            if (isCritical) explosions.push(new CriticalEffect(enemy.x, enemy.y));
-                            if (isWeakHit) {
-                                hitEffects.push(new WeakPointHitEffect(enemy.x, enemy.y));
-                            }
-                            // 非クリティカル時：小さいスター十字ヒットエフェクト
-                            if (!isCritical) {
-                                const hitX = marble.x - normalX * marble.radius;
-                                const hitY = marble.y - normalY * marble.radius;
-                                hitEffects.push(new StarHitEffect(hitX, hitY));
-                            }
-                            // 直接ヒット時：1フレームだけ物理更新を停止して当たったフレームを見せる
-                            hitFreezeFrames = 1;
-                            playHitSound(isCritical);
-                            if (enemy.takeDamage(damageToApply)) {
-                                defeated++; totalDefeated++;
-                                explosions.push(new Explosion(enemy.x, enemy.y, enemy.radius, enemy.color));
-                                enemies.splice(i, 1);
-                                if (Math.random() < 0.20 && teamHP < MAX_TEAM_HP) {
-                                    const healAmount = 10; teamHP = Math.min(roundHP(teamHP + healAmount), MAX_TEAM_HP);
-                                    explosions.push(new HealEffect(enemy.x, enemy.y));
-                                    updateHPBar();
+                            // ★ 法線方向へ「突っ込んでいる」瞬間＝1回の弾き。その時だけ反射＆ダメージ。
+                            //   挟まり中は壁/敵で跳ね返るたびに再び dotProduct<0 が成立し、カンカンと多段ヒットする。
+                            //   接触したまま静止している間（dotProduct>=0）は無駄打ちしない。
+                            if (dotProduct < 0) {
+                                // ほぼ弾性反射：速度を保ってカンカンを継続させる（旧:×0.90で即停止していた）
+                                marble.vx -= 2 * dotProduct * normalX; marble.vy -= 2 * dotProduct * normalY;
+                                marble.vx *= ENEMY_RESTITUTION; marble.vy *= ENEMY_RESTITUTION;
+
+                                const isCritical = Math.random() < 0.15;
+                                const baseDamage = (1.5 + playerAttackBonus) * marble.type.attackMult * (marble.isSpecialShot ? 3 : 1) * (marble.debuffHalfPower ? 0.5 : 1.0);
+                                // 弱点ヒット判定（ボスのみ）
+                                const isWeakHit = enemy.hitWeakPoint(marble.x, marble.y);
+                                const weakMult = isWeakHit ? 2.0 : 1.0;
+                                const damageToApply = (isCritical ? baseDamage * 7.5 : baseDamage) * weakMult;
+                                if (isCritical) explosions.push(new CriticalEffect(enemy.x, enemy.y));
+                                if (isWeakHit) {
+                                    hitEffects.push(new WeakPointHitEffect(enemy.x, enemy.y));
                                 }
-                                updateUI();
-                                if (enemies.length === 0) { pendingStageClear = true; clearBulletsAfterClear(); }
+                                // 非クリティカル時：小さいスター十字ヒットエフェクト
+                                if (!isCritical) {
+                                    const hitX = marble.x - normalX * marble.radius;
+                                    const hitY = marble.y - normalY * marble.radius;
+                                    hitEffects.push(new StarHitEffect(hitX, hitY));
+                                }
+                                playHitSound(isCritical);
+                                const killed = enemy.takeDamage(damageToApply);
+                                // ★ ヒットストップは「見せ場」だけ：撃破は気持ち長め、会心/弱点は短め。
+                                //   通常のカンカン1発ごとに凍結するとカンカンがカクつくため、通常ヒットでは凍結しない。
+                                if (killed) hitFreezeFrames = 4;
+                                else if (isCritical || isWeakHit) hitFreezeFrames = 2;
+                                // ★ 画面シェイク：通常カンカンは控えめな震え、会心は強め（撃破時は爆発側でさらに加算される）
+                                screenShake = Math.min(24, screenShake + (isCritical ? 9 : isWeakHit ? 7 : 1.4));
+                                if (killed) {
+                                    defeated++; totalDefeated++;
+                                    explosions.push(new Explosion(enemy.x, enemy.y, enemy.radius, enemy.color));
+                                    enemies.splice(i, 1);
+                                    if (Math.random() < 0.20 && teamHP < MAX_TEAM_HP) {
+                                        const healAmount = 10; teamHP = Math.min(roundHP(teamHP + healAmount), MAX_TEAM_HP);
+                                        explosions.push(new HealEffect(enemy.x, enemy.y));
+                                        updateHPBar();
+                                    }
+                                    updateUI();
+                                    if (enemies.length === 0) { pendingStageClear = true; clearBulletsAfterClear(); }
+                                }
                             }
                         }
                     }
